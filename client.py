@@ -18,9 +18,11 @@ import os
 import json
 import time
 import sys
+import ssl
 from typing import Dict, Optional, Any, List, Union, Callable, Awaitable
 
 PROMPT = ":(you)::> "
+MULTILINE_PROMPT = ":(multiline)::> "
 DEFAULT_PORT = 1107
 
 USERNAME = os.environ.get('USER', os.environ.get('USERNAME'))
@@ -41,10 +43,15 @@ class Client():
         self.username = None
         self.server_addr = server_addr
         self.websocket = None
+        self.multiline_mode = False  # Track multiline mode
+        self.multiline_buffer = []  # Store multiline input
 
-        # store command methods
+        # Store command methods
         self.commands: Dict[str, Callable[[List[str]], Awaitable[None]]] = {
             'flag': self.cmd_flag,
+            'multiline': self.cmd_multiline,
+            'clear': self.cmd_clear,
+            'help': self.cmd_help,
         }
 
         self.host: str = server_addr
@@ -54,7 +61,7 @@ class Client():
             components = server_addr.split(":")
             self.host = components[0]
             self.port = int(components[1])
-    
+
     async def run(self) -> None:
         """
         Main run loop for the client
@@ -76,11 +83,16 @@ class Client():
             'from': USERNAME,
         }
 
+        # Create SSL context for WSS (disable verification for self-signed certificates in testing)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
         with console.status("☢️ Connecting to Radioactive Tinapay server...", spinner="earth"):
             try:
                 # Add 60 second timeout to connection attempt
                 self.websocket = await asyncio.wait_for(
-                    websockets.connect(f'ws://{host}:{port}'),
+                    websockets.connect(f'wss://{host}:{port}', ssl=ssl_context),
                     timeout=60
                 )
                 await self.websocket.send(json.dumps(payload))
@@ -97,7 +109,7 @@ class Client():
                 try:
                     data = await self.websocket.recv()
                     response = json.loads(data)
-                    
+
                     if response.get('type') == 'auth':
                         if response.get('status') == 'accepted':
                             console.print("[green bold]✅ Connection accepted![/green bold]")
@@ -112,8 +124,8 @@ class Client():
                     console.print(f"[red bold]❌ Error during authentication: {e}[/red bold]")
                     await self.websocket.close()
                     sys.exit(1)
-        
-        # Client banner 
+
+        # Client banner
         print("██████╗  █████╗ ██████╗        ████████╗██╗███╗   ██╗   ")
         print("██╔══██╗██╔══██╗██╔══██╗       ╚══██╔══╝██║████╗  ██║   ")
         print("██████╔╝███████║██║  ██║          ██║   ██║██╔██╗ ██║   ")
@@ -194,8 +206,29 @@ class Client():
         """
         with patch_stdout():
             while True:
-                msg = await session.prompt_async(PROMPT)
-                await self.parse(msg)
+                prompt = MULTILINE_PROMPT if self.multiline_mode else PROMPT
+                msg = await session.prompt_async(prompt)
+                if self.multiline_mode:
+                    if msg.strip().upper() == "END":
+                        # Exit multiline mode and send the message
+                        message = "\n".join(self.multiline_buffer)
+                        if message:
+                            payload = {
+                                'type': 'msg',
+                                'from': self.username,
+                                'content': message,
+                                'timestamp': time.time()
+                            }
+                            if self.websocket:
+                                await self.websocket.send(json.dumps(payload))
+                                await self.new_msg(f"[green]Sent multiline message:[/green] {message}")
+                        self.multiline_mode = False
+                        self.multiline_buffer = []
+                        await self.new_msg("[yellow bold]Multiline mode off[/yellow bold]")
+                    else:
+                        self.multiline_buffer.append(msg)
+                else:
+                    await self.parse(msg)
 
     async def new_msg(self, msg: str) -> None:
         """
@@ -218,11 +251,11 @@ class Client():
             string: JSON string with added metadata for server
         """
         tokens: List[str] = msg.strip().split()
-        payload: MessageData = {'from': USERNAME, 'timestamp': time.time()}
+        payload: MessageData = {'from': self.username, 'timestamp': time.time()}
 
         if msg.startswith('/'):  # Command
             command = tokens[0][1:]  # Remove the leading '/'
-            
+
             if command == 'quit':
                 await self.stop()
                 return
@@ -243,7 +276,7 @@ class Client():
         """Handle flag submission"""
         if len(tokens) < 2:
             await self.new_msg("[red bold]ERROR:[/red bold] Invalid flag command format")
-            await self.new_msg("Usage: /flag \\[submit|show] <challenge_name> <flag> <flag_value>")
+            await self.new_msg("Usage: /flag \\[submit|show] <challenge_name> <flag> <points>")
             return
 
         action = tokens[1]
@@ -251,13 +284,17 @@ class Client():
         if action == 'submit':
             if len(tokens) < 5:
                 await self.new_msg("[red bold]ERROR:[/red bold] Invalid flag submission format")
-                await self.new_msg("Usage: /flag submit <challenge_name> <flag> <flag_value>")
+                await self.new_msg("Usage: /flag submit <challenge_name> <flag> <points>")
                 return
-                
+
             challenge_name = tokens[2]
             flag_value = tokens[3]
-            flag_points = str(tokens[4])  # Convert to string to ensure proper rendering
-            
+            try:
+                flag_points = int(tokens[4])  # Convert to integer
+            except ValueError:
+                await self.new_msg("[red bold]ERROR:[/red bold] Points must be a valid integer")
+                return
+
             # Send flag submission to server
             data = {
                 'type': 'flag',
@@ -266,9 +303,10 @@ class Client():
                     'action': 'submit',
                     'challenge_name': challenge_name,
                     'flag_value': flag_value,
-                    'flag_points': flag_points,
+                    'flag_points': flag_points,  # Send as integer
                 },
             }
+            await self.websocket.send(json.dumps(data))
         elif action == 'show':
             data = {
                 'type': 'flag',
@@ -277,9 +315,41 @@ class Client():
                     'action': 'show',
                 },
             }
+            await self.websocket.send(json.dumps(data))
         else:
             await self.new_msg("[red bold]ERROR:[/red bold] Invalid flag action")
-            await self.new_msg("Usage: /flag \\[submit|show] <challenge_name> <flag> <flag_value>")
+            await self.new_msg("Usage: /flag \\[submit|show] <challenge_name> <flag> <points>")
             return
 
-        await self.websocket.send(json.dumps(data))
+    async def cmd_multiline(self, tokens: List[str]) -> None:
+        """Toggle multiline mode"""
+        if self.multiline_mode:
+            await self.new_msg("[yellow bold]Already in multiline mode. Type 'END' on a new line to send.[/yellow bold]")
+        else:
+            self.multiline_mode = True
+            self.multiline_buffer = []
+            await self.new_msg("[yellow bold]Multiline mode on. Type 'END' on a new line to send the message.[/yellow bold]")
+
+    async def cmd_clear(self, tokens: List[str]) -> None:
+        """Clear the terminal screen"""
+        console.clear()
+        await self.new_msg("[green bold]INFO:[/green bold] Terminal cleared")
+
+    async def cmd_help(self, tokens: List[str]) -> None:
+        """Display all available client commands"""
+        table = Table(title="[yellow bold]Client Commands[/yellow bold]")
+        table.add_column("Command", style="cyan")
+        table.add_column("Usage", style="green")
+
+        commands = [
+            ("/flag", "/flag [submit|show] <challenge_name> <flag> <points> - Submit or display flags"),
+            ("/multiline", "/multiline - Enter multiline mode (type 'END' to send)"),
+            ("/clear", "/clear - Clear the terminal screen"),
+            ("/help", "/help - Display this help message"),
+            ("/quit", "/quit - Disconnect from the server")
+        ]
+
+        for cmd, usage in commands:
+            table.add_row(cmd, usage)
+
+        await self.new_msg(table)
