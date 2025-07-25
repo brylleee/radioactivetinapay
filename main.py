@@ -17,7 +17,7 @@ CONFIG = "radtinconf.yml"
 async def main() -> None:
     args: List[str] = sys.argv
     if len(args) < 2:
-        print("☢️ Radioactive Tinapay: A1SBERG's SATCOM")
+        print("☢️ Radioactive Tinapay: The Deadliest Bread in CTF History")
         print(f"Usage: {args[0]} mode [options]")
         print("\nMode:")
         print("    server               Act as an RTC server (requires -l flag)")
